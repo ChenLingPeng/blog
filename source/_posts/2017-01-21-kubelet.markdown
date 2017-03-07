@@ -1,0 +1,106 @@
+---
+layout: post
+title: Kubelet Introduction
+category:
+tag: [kubernetes, kubelet]
+---
+
+> kubernetes(k8s)是一个开源的分布式容器集群管理系统，用户对容器进行部署，扩展和管理。
+
+kubelet是k8s中重要的工作模块。每个kubernetes集群的实际工作节点上都需要运行这个一个进程(agent)来进行实际作业（pod/container）的运行，类似于NodeManager在Yarn集群中的地位。在kunernetes架构下，pod是作业运行的最小单元。PodSpec描述一个Pod作业的具体信息，kubelet的主要作用就是通过一定的机制（如从apiserver）拿到这些PodSpec在本地对PodSpec中描述的container信息进行执行，并保证PodSpec中描述的container信息与实际运行的container一致，并对这些pod/container状态信息实时上报到apiserver。
+
+> apiserver 是k8s中的重要组件，apiserver代理了其他组件（kubelet, scheduler, controller等）对资源的读写操作，目前以rest接口的形式提供。apiserver提供了对单个资源(pod/deployment等)的增删改查，对一类资源的list/watch等功能。
+
+kubelet的核心代码在pkg/kubelet下，由于其涉及到的模块很多，所以下面又有多个子包分别负责不同的事物处理。另外还有例如volume管理的代码在外部支持。主要的工作组件如图所示：
+
+![kubelet](/images/kubelet.png)
+
+> 在kubelet启动之后，会有一个主循环从各个渠道（具体下面阐述）获取Pod的状态更新。将这个Pod的更新通知到PodWorkers，由PodWorkers去完成对Pod的管理。
+
+# 组件介绍
+
+kubelet包的主要包括以下几个重要组件：
+
+## PLEG
+
+PLEG(Program Logic Event Generator), 即由程序逻辑事件生成器。在kubelet中，由PLEG组件对本机上运行的pod/container状态进行周期性的检查，并根据状态的变化(转移)生成container的相应事件交给kubelet相关组件处理（如图）。
+
+![pleg1](/images/pleg-container-events.png)
+
+例如，在周期性的检查中可以发现一个在上次还处于ContainerCreate的container现在已经是ContainerRunning了，就会发出一个ContainerStarted事件放到pleg的channel中供下文中提到的PodWorkers处理，根据这个状态变化，podWorkers会重新检查当前pod下的container是否正如PodSpec中定义的一样运行。
+
+在周期性检查中，PLEG组件还会通过containerRuntime提供的接口去获取本地Pod下container的运行状态进行缓存(放在podCache中)，podWorkers的操作会用到cache中的container状态去往apiserver更新pod状态。这个的好处是如果同一个pod同时有多个状态变化请求，可以直接从cache中拿到container状态而不用每次都调用containerRuntime接口。
+
+## StatusManager
+
+StatusManager, 负责管理Pod的状态信息。其主要工作是将本地的Pod状态的更新信息同步到apiserver上。主要体现在SetPodStatus/SetContainerReadiness/TerminatePod三个方法，分别是设置Pod的状态，container的Ready状态以及删除apiserver上的Pod。其中SetContainerReadiness方法被ProbeManager的readinessProbe调用。SetPodStatus在pod被reject或者进行podWorker sync的时候调用，将本地的pod状态更新到apiserver。TerminatePod在kubelet不断获取pod的更新时如果发现Pod已经终止且可以删除(DeletionTimestamp)，则会调用Delete接口删除apiserver的Pod。
+
+## PodManager
+
+PodManager维护了apiserver上的Pod的本地映射。所有调度到本kubelet的pod都可以在这里找到。此外，对于staticPod，会在apiserver上创建对应的mirrotPod，PodManager还维护了这部分的信息映射。
+
+## ProbeManager
+
+ProbeManager负责对pod中container定义的ReadinessProbe和LivenessProbe进行处理，即对container进行用户自定义的健康检查。ProbeManager对每个container的ReadinessProbe和LivenessProbe都创建一个worker，在自己的goroutine中执行probe。对于不同的probe，分别会将结果放到readinessManager/livenessManager中。对于readiness类型的probe，probeManager会不断从这个manager中得到结果并调用statusManager的SetContainerReadiness接口更新pod状态到apiserver。对于liveness的probe，在kubelet的周期循环中会得到livenessProbe的结果重新触发Pod的同步，不健康的container会根据重启策略进行重启或者将状态置为failed。
+
+此外，ProbeManager中提供了 UpdatePodStatus 方法，用于在podworkers sync时设置Pod中containerStatus的Ready字段。
+
+## PodWorkers
+
+PodWorkers在之前已经提到过，负责对Pod的更新作出处理。PodWorker实际相当于一个Pod处理的中转站，所有Pod的本地同步处理都经过它发起，由它控制*相同Pod在一个goroutine中串行处理*。处理时会拿到Pod最新的运行时状态进行处理。主要调用kubelet的syncPod函数，由该函数完成实际的pod管理。这部分具体另起文章详细介绍。
+
+## ContainerRuntime
+
+ContainerRuntime是管理运行时态Pod(container)的重要组件，即操作底层的runtime来执行用户定义的podSpec。例如docker_tool包下面的runtime属于docker。ContainerRuntime本身是一个接口定义，定义了实现这个接口的具体底层需要完成的功能，根据底层来具体选择这个Runtime（docker/rkt）。目前kubelet还在实现CRI形式进行管理。Runtime接口实现了对runtime的管理，常用的接口包括GetPods, KillPod, GetPodStatus(获取pod的container的状态), DeleteContainer. 最主要的一个接口是SyncPod，在podWorker调用syncPod时调用。SyncPod负责创建container，设置网络，设置cgroup参数，维护实际运行状态与PodSpec一致性等。这部分具体实现(docker)另起文章详细介绍。
+
+## EvictManager
+
+这个组件主要用于维护kubelet节点的稳定性，主要利用cAdvisor监控机器运行状态，Mem/Disk等。如果调度到本地的Pod运行可能影响节点的稳定性，就会将这个Pod进行Evict操作，killPod并将其状态置为Failed。
+
+## cAdvisor
+
+TODO
+
+## VolumeManager
+
+TODO
+
+## Network plugin
+
+TODO
+
+# 工作流程
+
+kubelet启动后需要向apiserver主动注册节点。scheduler发现节点后可以将pod调度到该节点上。
+kubelet会watch apiserver中那些pod.NodeName = this.NodeName的pod，放到PodUpdates的chan中给kubelet进行处理。其实除了从apiserver获取pod资源，还可以从本地文件或者自定义的http endpoint中得到pod，这些渠道获取的Pod被称为static pod，会在apiserver创建对应的pod称为mirror pod。
+
+kubelet的工作从syncLoop发起，syncLoop主要获取构造几个channel，一个是从apiserver监听的pod变化的事件（包括创建，更新，删除），一个是syncTicker，负责每秒发送一个tick出发一些更新（下面会讲到），一个是housekeepingTicker，每15s触发一次，进行housekeeping的操作，最后一个是由pleg生成的channel，这里会生成一些container变更的事件给主程序进行处理。
+构造完后将这几个channel交给syncLoopIteration处理，每次select出一个channel进行事件处理。
+
+1. 如果有从apiserver来的pod，则调用HandlePodXXX来进行事件处理，
+2. 如果从pleg有container的事件且不是container移除的事件，则调用HandlePodSyncs来重新同步pod的container的状态信息。另外如果container的事件是ContainerDied的话，还会触发会pod中container的cleanup操作，使得一个pod的退出的container数不超过一定值。
+3. 如果有来自livenessManager的关于container的livenessProbe的失败结果，也调用HandlePodSyncs接口。
+4. 如果收到来自housekeeping的事件（每15秒一次），则调用HandlePodCleanups进行一些已经移除的pod的清理工作
+5. 如果收到来自syncCh的事件（每秒一次），则拿到需要重新同步的pod，需要同步的pod主要从workQueue的chan中获取，由podWorkers在同步了pod之后放入workQueue中一定事件后从workQueue的chan中拿出。调用HandlePodSyncs。
+
+HandlePodXXX方法基本都是调用dispatchWork，在这个函数中调用podWorkers的UpdatePod函数对pod进行实际的处理（调用kubelet.syncPod方法）。另外HandlePodAdditions和HandlePodRemoves还会在probeManager注册/注销containerProbe。
+
+
+podWorkers给每个pod创建一个goroutine执行kubelet的syncPod函数，首先根据现在的podStatus生成apiPodStatus，然后调用statusManager的SetPodStatus方法将status更新到apiserver。创建相关的pod目录，将volume挂载到本地，从apiserver获取pull secret，然后到最重要的一步，调用containerRuntime的SyncPod方法，这里调用的docker_tool下面的dockerManager的SyncPod方法。把sync的结果保存到reasonCache中。
+
+podWorkers处理之后会将pod放入到workQueue中供后续syncCh拿出重新同步状态，使得Pod的containers始终遵循pod的spec内容。
+
+---
+
+一个Pod的执行流程大体如上所诉。总结来说，从pod被调度器调度到kubelet节点开始，kubelet watch到该pod，将pod放到kubelet的循环中处理。首先将其放入probeManager对readiness/liveness进行定期probe。然后放入podWorker中，在podWorker中调用kubelet.syncPod，将最新的pod status同步到apiserver，设置本地目录，mount相关的volume，获取image的pull secret，然后调用containerRuntime的SyncPod（在SyncPod中拉去image，启动container）。然后将pod放入到workQueue中。等到pod在workQueue中到达一个时间点，或者Pod/Container有变化，重新通过kubelet主循环放到podWorker中重新处理，重新生成podStatus，重新调用SyncPod等。
+
+
+
+## 其他
+
+除了以上这些跟Pod处理直接相关的模块外，kubelet还有一些其他的模块。例如evict模块负责对调度到本地的Pod进行审查，决定是否需要拒绝这个Pod。containerGC和imageGC负责定期清理本地退出的container和image。cadvisor模块监控本地资源的运行使用情况。OOM负责为container的OOMAdjust打分，控制资源的使用。网络模块负责设置Pod的网络模式。此外，kubelet本身也起了一个http server，通过接口可以获取到本地Pod/Container的一些信息。
+
+# Issue
+
+目前，kubelet有一些重要的特性在进行需要关注，例如多卡GPU的支持，Pod level cgroup的支持，kubelet CRI等。
+

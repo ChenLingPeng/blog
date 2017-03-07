@@ -1,0 +1,27 @@
+---
+layout: post
+title: Golang笔记
+category: lang
+tag: [lang, golang]
+---
+
+1. Mac系统无法编译运行平台相关代码
+
+	项目中引入了一个第三方包，有一个包下面的文件是 xxx_linux.go xxx_windows.go, 在Mac上无法通过编译。
+	在编译之前加入GOOS=linux可以完成编译但是无法执行，需要在这类包中加入 xxx_(unix|darwin|unsupported).go，才可以在Mac上进行执行。
+
+2. 平台相关文件
+
+	可以使用_(linux|unix|freebsd|unsupported)结尾表示在什么平台使用，也可以在文件的头部使用`// +build linux`著名特定平台。
+	常见写法：
+
+	```
+	// +build arm64,darwin
+	// +build !gccgo
+	// +build darwin,!race linux,!race freebsd,!race netbsd openbsd solaris dragonfly
+	// +build mips64 mips64le
+	// +build !go1.2
+	```
+
+	详细可以查看 [go-build官网](https://golang.org/pkg/go/build/)
+

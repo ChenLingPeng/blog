@@ -1,7 +1,7 @@
 ---
 title: tcpdump quick start
 date: 2017-03-07 19:41:31
-tags:
+tags: [network, tcpdump]
 ---
 
 tcpdump是linux上用于截获数据包的分析工具，提供了强大的包过滤和展示功能
@@ -90,7 +90,7 @@ tcpdump的用法主要是`tcpdump [option] [expression]`
 例子：
 `dst host 10.100.10.1 and (ip proto \udp or src port 80)`
 
-
+`tcpdump -vvnneSs 0 -i veth_host host 192.168.84.193 and icmp`
 
 
 ## 参考

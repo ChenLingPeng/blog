@@ -129,7 +129,7 @@ calicoctl get ipPool -o yaml > pool.yaml
     cidr: 192.168.0.0/16
   spec:
     ipip:
-    enabled: true
+      enabled: true
     nat-outgoing: true
 
 calicoctl replace -f pool.yaml
@@ -168,9 +168,90 @@ blackhole 192.168.84.192/26  proto bird
 
 测试项 | 命令 | Bandwidth | Retr
 ---- | --- | --- | ---
-主机网络 | iperf3 -c 172.17.8.101 -n 10000M -O 3 | 2.25 Gbits/sec | 55672
-docker host | docker run --rm -it --net host networkstatic/iperf3 -c 172.17.8.101 -n 10000M -O 3 | 2.22 Gbits/sec | 55285
-calico | docker run --rm -it --net net1 networkstatic/iperf3 -c 192.168.84.209 -n 10000M -O 3 | 2.09 Gbits/sec | 36470
-calico-ipip | docker run --rm -it --net net1 networkstatic/iperf3 -c 192.168.84.208 -n 10000M -O 3 | 2.15 Gbits/sec | 4516
+主机网络 | `iperf3 -c 172.17.8.101 -n 10000M -O 3` | 2.25 Gbits/sec | 55672
+docker host | `docker run --rm -it --net host networkstatic/iperf3 -c 172.17.8.101 -n 10000M -O 3` | 2.22 Gbits/sec | 55285
+calico | `docker run --rm -it --net net1 networkstatic/iperf3 -c 192.168.84.209 -n 10000M -O 3` | 2.09 Gbits/sec | 36470
+calico-ipip | `docker run --rm -it --net net1 networkstatic/iperf3 -c 192.168.84.208 -n 10000M -O 3` | 2.15 Gbits/sec | 4516
 
 可以看到ipip的性能还要稍微好于非ipip模式，且在ipip模式下TCP的重传较少。总体来看，对比host模式，calico的性能损失不大。
+
+对于上面的测试结果（ipip模式比非ipip模式要好）存在疑惑，因为实际上相比于非ipip模式，ipip模式下需要多经历一次ip包的封装。针对这个疑惑我在社区提了个[issue](https://github.com/projectcalico/calico/issues/621)。根据回复中的建议在iperf命令中加入了`-M 1440`设置mtu参数，结果显示非ipip模式实际是要比较好的，这比较符合常理。（注：1440是calico的tunl0的mtu值）
+
+# 自己动手
+calico实际上就是对本机容器ip在主机上建立路由，并将这些路由通过bgp协议告知其他主机。通过路由表的信息，达到主机垮主机的容器通信。
+下面使用同事给的demo使用linux的ip命令工具来模拟calico的非ipip网络和ipip网络。
+
+1. 首先创建两个虚拟机host1(dev enp0s8:172.17.8.101)和host2(dev enp0s8:172.17.8.102)，检查是否可以相互ping通
+2. 在host1上执行以下命令创建容器网络
+
+  ```shell
+  # netns内部ip, 假设本机上所有container的网段在192.168.41.0/24
+  ip=192.168.41.2
+  ctn=ctn1
+  ip netns add $ctn
+  ip li add dev veth_host type veth peer name veth_sbx
+  ip link set dev veth_sbx netns $ctn
+  ip netns exec $ctn ip ad add $ip dev veth_sbx
+  ip netns exec $ctn ip link set dev veth_sbx up
+  ip netns exec $ctn ip route add 169.254.1.1 dev veth_sbx
+  ip netns exec $ctn ip route add default via 169.254.1.1 dev veth_sbx
+  ip netns exec $ctn ip ad
+  ip netns exec $ctn ip link set dev veth_sbx up
+  ip link set dev veth_host up
+  ip ad show veth_host
+  ip netns exec $ctn ip neigh add 169.254.1.1 dev veth_sbx lladdr `cat /sys/class/net/veth_host/address` 
+  ip route add $ip dev veth_host
+  # 打开ip_forward
+  echo 1 > /proc/sys/net/ipv4/ip_forward
+  ```
+
+3. 将上诉脚本的ip地址改为192.168.42.2，在host2执行
+4. 执行以下步骤添加路由表项以达到跨主机container访问
+
+  ```
+  # 在host2执行下面命令
+  ip route add 192.168.41.0/24 via 172.17.8.101 dev enp0s8
+  # 在host1执行下面命令
+  ip route add 192.168.42.0/24 via 172.17.8.102 dev enp0s8
+  ```
+
+5. 这样就可以在主机或者容器网络空间内ping跨主机的container ip了
+
+  ```
+  # 在host1 ping host2的container
+  ip netns exec ctn1 ping 192.168.42.2
+  ```
+
+通过上诉步骤，就模拟了calico的默认网络。
+
+通过之前的描述，calico实际还支持ipip模式的跨主机通信，原理就是通过tunnel设备对原始ip报文进行封装。只需要对上述脚本做一些修改就可以：
+
+1. 在两台主机上将上诉过程中的第4步添加的路由规则去掉
+2. 在host1上执行以下脚本
+
+  ```shell
+  ipip=192.168.41.3
+  # 这个命令会生成一个tunl0设备
+  modprobe ipip
+  ip link set tunl0 up
+  ip a add $ipip brd + dev tunl0
+  # 注意这里的路由规则，前面已经提到过，使用tunl0设备！最后一个参数onlink是必须的，具体作用参考[这里](http://lartc.vger.kernel.narkive.com/XgcjFTGM/aw-onlink-option-for-ip-route)
+  ip r add 192.168.42.0/24 via 172.17.8.102 dev tunl0 proto bird onlink
+  ```
+
+3. 在host2上执行类似上诉步骤
+4. 重新进入网络空间ping跨主机container ip
+5. 可以在对端的enp0s8网卡上使用tcpdump进行截包
+
+  ```
+  tcpdump -vvnneSs 0 -i enp0s8
+
+  07:41:03.985150 08:00:27:d5:4b:b1 > 08:00:27:29:bc:de, ethertype IPv4 (0x0800), length 118: (tos 0x0, ttl 63, id 55151, offset 0, flags [DF], proto IPIP (4), length 104)
+      172.17.8.101 > 172.17.8.103: (tos 0x0, ttl 63, id 16085, offset 0, flags [DF], proto ICMP (1), length 84)
+      192.168.41.2 > 192.168.43.2: ICMP echo request, id 15973, seq 30, length 64
+  07:41:03.985243 08:00:27:29:bc:de > 08:00:27:d5:4b:b1, ethertype IPv4 (0x0800), length 118: (tos 0x0, ttl 63, id 32595, offset 0, flags [none], proto IPIP (4), length 104)
+      172.17.8.103 > 172.17.8.101: (tos 0x0, ttl 63, id 42711, offset 0, flags [none], proto ICMP (1), length 84)
+      192.168.43.2 > 192.168.41.2: ICMP echo reply, id 15973, seq 30, length 64
+  ```
+
+ipip相对于非ipip模式会有一些性能的损失，但是好处在于ipip模式下可以进行跨网段的主机间容器通信！将上诉的脚本的两个不同网段的主机上测试可以验证这个结果。

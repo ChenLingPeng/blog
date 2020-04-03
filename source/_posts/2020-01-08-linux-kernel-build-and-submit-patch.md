@@ -1,5 +1,5 @@
 ---
-title: linux kernel build and submit patch
+title: linux 内核源码修改编译与patch提交
 date: 2020-01-08 18:25:13
 tags: [kernel]
 ---

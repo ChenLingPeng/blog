@@ -29,7 +29,7 @@ tags: [ebpf, kernel]
 3. struct初始化问题
 
     定义结构体
-    ```
+    ```C
     #define SERVER_SIDE 0
     struct sock_info {
         u64 ts;
@@ -41,7 +41,7 @@ tags: [ebpf, kernel]
     ```
 
     按以下方式初始化结构体会报错
-    ```
+    ```C
     struct sock_info info = {
     .ts = 0,
     .direct = SERVER_SIDE,
@@ -55,7 +55,7 @@ tags: [ebpf, kernel]
 5. 关于从kretprobe中获取函数入参
 
     kretprobe获取函数入参，使用`ctx->bx`
-    ```
+    ```C
     int kretprobe__tcp_set_state(structpt_regs*ctx){
     struct sock*sk=(void*)ctx->bx;
     u16 dport = sk->__sk_common.skc_dport;
@@ -77,19 +77,19 @@ tags: [ebpf, kernel]
 
 6. 获取当前进程cgroup path
 
-    ```
+    ```C
     task = (struct task_struct *)bpf_get_current_task();
     u32 nr_tasks = task->cgroups->nr_tasks;
     char name[100];
     char path[100];
     u32 readn = bpf_probe_read_str(&name, sizeof(name), task->sched_task_group->css.cgroup->kn->name);
     if (task->sched_task_group->css.cgroup->kn->parent) {
-    u32 len = bpf_probe_read_str(&path, sizeof(path), task->sched_task_group->css.cgroup->kn->parent->name);
-    if (len > 3) {
-        if (path[0]=='p' && path[1]=='o'&&path[2]=='d') {
-            // this is a pod
+        u32 len = bpf_probe_read_str(&path, sizeof(path), task->sched_task_group->css.cgroup->kn->parent->name);
+        if (len > 3) {
+            if (path[0]=='p' && path[1]=='o'&&path[2]=='d') {
+                // this is a pod
+            }
         }
-    }
     }
     ```
 
@@ -109,3 +109,61 @@ tags: [ebpf, kernel]
 9. map空间问题
 
     bcc下bpf map有默认值，有时候需要注意下是否足够，例如我之前用BPF_HASH来记录tcp连接情况，可能默认的10240是不够的
+
+10. gobpf库读取percpu map问题
+    
+    目前gobpf库使用Get/GetP读取map value时，当map类型是percpu类型时，无法完成取出每个cpu对应的值，需要做相应改变，对应的[PR](https://github.com/iovisor/gobpf/pull/254/files)
+
+11. 可以使用`lock_xadd`来解决并发写问题，不过如果可能的话尽量使用 percpu 相关的map来进行计数等操作。
+
+    `lock_xadd`其实也是调用的`__sync_fetch_and_add`
+
+12. linux版本相关的条件编译 `#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)`
+
+13. 有限的for循环
+
+    ebpf本身不允许循环的存在，因为会被判定为可能无法及时退出，影响内核执行效率。不过我们如果可以预见到循环将在有限次循环之后退出，可以使用`#pragma unroll`来在编译期间展开for循环，通过bpf的verify组件。当然，循环的次数是有限的，因为bpf本身代码指令的数量有限(4096)
+
+    ```C
+    static __inline int is_prefix(char *prefix, char *str)
+    {
+        int i;
+        #pragma unroll
+        for (i = 0; i < MAX_PATH_PREF_SIZE; prefix++, str++, i++) {
+            if (!*prefix)
+                return 1;
+            if (*prefix != *str) {
+                return 0;
+            }
+        }
+
+        // prefix is too long
+        return 0;
+    }
+    ```
+
+14. 判断是不是创建了一个容器(pid_namespace)
+
+    ```C
+    static __always_inline u32 get_task_ns_pid(struct task_struct *task)
+    {
+    #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 19, 0)
+        // kernel 4.14-4.18:
+        return task->pids[PIDTYPE_PID].pid->numbers[task->nsproxy->pid_ns_for_children->level].nr;
+    #else
+        // kernel 4.19 onwards:
+        return task->thread_pid->numbers[task->nsproxy->pid_ns_for_children->level].nr;
+    #endif
+    }
+    ```
+
+    可以通过判断`get_task_ns_pid`是否是1来判断是否新的进程是创建在容器里的, trace点在系统调用`execve`和`execveat`, 进程退出点在`do_exit`
+
+15. 获取参数问题
+
+    有2中方式可以获取kprobe触发函数的参数，一个是使用`PT_REGS_PARMN`的形式来获取，另一个是在你的kprobe hook函数上直接申明。对于复杂的数据结构，建议使用第2中方式直接在函数参数中声明，否则可能读不出来，load BPF程序的时候会报错。[issue3086](https://github.com/iovisor/bcc/issues/3086)
+
+16. BPF_PERCPU_HASH
+
+    bcc目前没有定义`BPF_PERCPU_HASH`这个宏，需要使用的话可以用 `BPF_TABLE("percpu_hash", _key_type, _leaf_type, _name, _size)` 来定义
+

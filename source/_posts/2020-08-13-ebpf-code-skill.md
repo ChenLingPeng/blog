@@ -167,3 +167,7 @@ tags: [ebpf, kernel]
 
     bcc目前没有定义`BPF_PERCPU_HASH`这个宏，需要使用的话可以用 `BPF_TABLE("percpu_hash", _key_type, _leaf_type, _name, _size)` 来定义
 
+17. stack空间限制512byte
+
+    一个bpf程序不能申请太多的栈空间，目前限制512B，多了就会报错：`Looks like the BPF stack limit of 512 bytes is exceeded.`。
+    例如在程序中申请了两个数组`char arr1[256];char arr2[256];`程序就会报错了

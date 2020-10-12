@@ -171,3 +171,12 @@ tags: [ebpf, kernel]
 
     一个bpf程序不能申请太多的栈空间，目前限制512B，多了就会报错：`Looks like the BPF stack limit of 512 bytes is exceeded.`。
     例如在程序中申请了两个数组`char arr1[256];char arr2[256];`程序就会报错了
+
+18. bpf程序需要特权
+
+    加载bpf程序需要一定的特权，比如使用bpf syscall需要SYS_ADMIN权限。所以我们在docker中跑的时候一般使用`--privileged`。如果在k8s环境，有些环境可能并不能直接使用privileged，此时需要使用capabilities来给bpf程序必要的权限。测试会发现，只添加SYS_ADMIN权限还是不够的，运行时会报类似`could not open bpf map: cstat, error: Operation not permitted`的错误。strace一下系统调用可以看到，权限问题是在调用prlimit64时出现的。
+    ```
+    prlimit64(0, RLIMIT_MEMLOCK, NULL, {rlim_cur=64*1024, rlim_max=64*1024}) = 0
+    prlimit64(0, RLIMIT_MEMLOCK, {rlim_cur=RLIM64_INFINITY, rlim_max=RLIM64_INFINITY}, NULL) = -1 EPERM (Operation not permitted)
+    ```
+    查阅资料可知，要设置memlock，除了SYS_ADMIN，还需要SYS_RESOURCE
